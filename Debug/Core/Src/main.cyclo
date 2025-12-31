@@ -1,0 +1,12 @@
+../Core/Src/main.c:71:6:HAL_UART_RxCpltCallback	6
+../Core/Src/main.c:91:5:_write	1
+../Core/Src/main.c:97:10:AS5600_ReadAngle	3
+../Core/Src/main.c:107:7:PID_Compute	3
+../Core/Src/main.c:123:5:main	12
+../Core/Src/main.c:218:6:SystemClock_Config	3
+../Core/Src/main.c:241:13:MX_I2C1_Init	1
+../Core/Src/main.c:253:13:MX_TIM3_Init	1
+../Core/Src/main.c:273:13:MX_USART3_UART_Init	1
+../Core/Src/main.c:284:13:MX_USB_OTG_FS_PCD_Init	1
+../Core/Src/main.c:297:13:MX_GPIO_Init	1
+../Core/Src/main.c:333:6:Error_Handler	1
