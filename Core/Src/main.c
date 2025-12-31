@@ -2,7 +2,8 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : PID Control + Rhino Motor (Drive & Encoder Read)
+  * @brief          : NEMA Position Control + Rhino Continuous Read
+  * @board          : STM32F446ZE Nucleo
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -29,16 +30,18 @@ typedef struct {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+// --- NEMA / AS5600 SETTINGS ---
 #define AS5600_ADDR (0x36 << 1)
 #define AS5600_RAW_ANGLE_REG 0x0C
 #define GEAR_RATIO 10.56f
 #define RX_BUFFER_SIZE 20
 
 // --- RHINO SETTINGS ---
+// Using your original constant.
+// Note: Reference code used 93132. If your angle is wrong, try that number.
 #define RHINO_COUNTS_PER_REV 552800.0f
 
 // --- IMPORTANT: CHANGE THIS IF MOTOR RUNS AWAY ---
-// Set to 0 or 1 to flip motor direction logic
 #define MOTOR_INVERT_DIR 0
 /* USER CODE END PD */
 
@@ -50,9 +53,9 @@ typedef struct {
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
 
-TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
+TIM_HandleTypeDef htim8;
 
 UART_HandleTypeDef huart3;
 
@@ -61,21 +64,25 @@ PCD_HandleTypeDef hpcd_USB_OTG_FS;
 /* USER CODE BEGIN PV */
 // --- PID Instance ---
 PID_Controller pid = {
-    .Kp = 70.0f,      // Proportional Gain
-    .Ki = 10.00f,     // Integral
-    .Kd = 0.00f,      // Derivative
-    .outputLimit = 4000.0f, // Max Speed (Hz)
-    .minOutput = 100.0f     // Min Speed (Hz)
+    .Kp = 70.0f,
+    .Ki = 10.00f,
+    .Kd = 0.00f,
+    .outputLimit = 4000.0f,
+    .minOutput = 100.0f
 };
 
-// --- Global Variables ---
+// --- Global Variables (NEMA) ---
 volatile float target_angle = 0.0f;
 volatile uint8_t new_command_received = 0;
 float current_output_angle = 0.0f;
-
 long global_revolutions = 0;
 uint16_t prev_raw_angle = 0;
 int first_reading = 1;
+
+// --- Global Variables (RHINO) ---
+// We use 64-bit int to track total ticks forever without overflow issues
+volatile int64_t rhino_total_ticks = 0;
+volatile int16_t rhino_prev_count = 0;
 
 // UART Variables
 uint8_t rx_byte;
@@ -91,11 +98,12 @@ static void MX_USB_OTG_FS_PCD_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
-static void MX_TIM2_Init(void);
+static void MX_TIM8_Init(void);
 /* USER CODE BEGIN PFP */
 uint16_t AS5600_ReadAngle(void);
 float PID_Compute(float setpoint, float measured);
 int _write(int file, char *ptr, int len);
+void Rhino_Update_Angle(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -141,18 +149,31 @@ uint16_t AS5600_ReadAngle(void) {
 float PID_Compute(float setpoint, float measured) {
     float error = setpoint - measured;
     float P = pid.Kp * error;
-
-    // Integral (Simplified windup guard)
     pid.integral += error;
     if (pid.integral > 500) pid.integral = 500;
     if (pid.integral < -500) pid.integral = -500;
-
     float I = pid.Ki * pid.integral;
     float D = pid.Kd * (error - pid.prevError);
     pid.prevError = error;
-
     return P + I + D;
 }
+
+// --- 5. RHINO UPDATE (From Reference Code Logic) ---
+void Rhino_Update_Angle(void) {
+    // CRITICAL: We use int16_t because TIM8 is a 16-bit timer on this board.
+    // Reading it as 16-bit allows the math (curr - prev) to handle overflow automatically.
+    int16_t curr_count = (int16_t)__HAL_TIM_GET_COUNTER(&htim8);
+
+    // Calculate difference (this handles the 65535 -> 0 wrap automatically)
+    int16_t diff = curr_count - rhino_prev_count;
+
+    // Add to total
+    rhino_total_ticks += diff;
+
+    // Update previous
+    rhino_prev_count = curr_count;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -163,7 +184,6 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -189,46 +209,47 @@ int main(void)
   MX_I2C1_Init();
   MX_TIM3_Init();
   MX_TIM4_Init();
-  MX_TIM2_Init();
+  MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
   // --- A. START PERIPHERALS ---
   HAL_UART_Receive_IT(&huart3, &rx_byte, 1);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); // AS5600 Motor PID
+
+  // NEMA Motor PWM
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
 
   // --- B. START RHINO MOTOR (Continuous Rotation) ---
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
-  // Force 20kHz Frequency (ARR=4199)
-  __HAL_TIM_SET_AUTORELOAD(&htim4, 4199);
-  // Set Direction
+  __HAL_TIM_SET_AUTORELOAD(&htim4, 4199); // 20kHz
   HAL_GPIO_WritePin(RHINO_DIR_GPIO_Port, RHINO_DIR_Pin, GPIO_PIN_SET);
-  // Set Speed (50% Duty)
-  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 2100);
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 2100); // 50% Speed
 
-  // --- C. START RHINO ENCODER ---
-  HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
+  // --- C. START RHINO ENCODER (TIM8) ---
+  // Using TIM8 as per your reference code
+  HAL_TIM_Encoder_Start(&htim8, TIM_CHANNEL_ALL);
 
-  printf("\r\n--- SYSTEM REBOOT ---\r\n");
-  printf("--- Rhino Motor & Encoder Active ---\r\n");
+  // Initialize Rhino Prev Count to avoid a jump at start
+  rhino_prev_count = (int16_t)__HAL_TIM_GET_COUNTER(&htim8);
+
+  printf("\r\n--- SYSTEM READY ---\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    // A. Heartbeat
-    HAL_GPIO_TogglePin(LD1_GPIO_Port, LD1_Pin);
+    // 1. Update Rhino Angle immediately
+    Rhino_Update_Angle();
 
-    // B. Command Confirmation
+    // 2. NEMA Logic
     if (new_command_received) {
         printf("\r\n>>> New Target: %.2f <<<\r\n", target_angle);
         new_command_received = 0;
     }
 
-    // C. Read AS5600 Position (Existing PID Logic)
     uint16_t curr_raw = AS5600_ReadAngle();
 
     if (curr_raw != 9999) {
-        // Multi-Turn Logic
+        // NEMA Multi-Turn Logic
         if (first_reading) { prev_raw_angle = curr_raw; first_reading = 0; }
         int delta = (int)curr_raw - (int)prev_raw_angle;
         if (delta < -2048) global_revolutions++;
@@ -238,21 +259,19 @@ int main(void)
         float total_motor_deg = (global_revolutions * 360.0f) + ((curr_raw * 360.0f) / 4096.0f);
         current_output_angle = total_motor_deg / GEAR_RATIO;
 
-        // D. PID Loop
+        // NEMA PID
         float pid_output = PID_Compute(target_angle, current_output_angle);
 
-        // E. Motor Control (TIM3 - Stepper/DC1)
+        // NEMA Motor Drive
         if (fabs(target_angle - current_output_angle) < 0.5f) {
             __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
             pid.integral = 0;
         }
         else {
             GPIO_PinState dir_state;
-            if (pid_output > 0) {
-                dir_state = (MOTOR_INVERT_DIR) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-            } else {
-                dir_state = (MOTOR_INVERT_DIR) ? GPIO_PIN_SET : GPIO_PIN_RESET;
-            }
+            if (pid_output > 0) dir_state = (MOTOR_INVERT_DIR) ? GPIO_PIN_RESET : GPIO_PIN_SET;
+            else dir_state = (MOTOR_INVERT_DIR) ? GPIO_PIN_SET : GPIO_PIN_RESET;
+
             HAL_GPIO_WritePin(STEP_DIR_GPIO_Port, STEP_DIR_Pin, dir_state);
 
             float freq = fabs(pid_output);
@@ -264,32 +283,32 @@ int main(void)
             __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, arr_val / 2);
         }
 
-        // F. CONTINUOUS LOGGING (Combined)
-        static uint32_t last_print = 0;
-        if (HAL_GetTick() - last_print > 200) {
+        // 3. LOGGING (Every 200ms)
+                static uint32_t last_print = 0;
+                if (HAL_GetTick() - last_print > 200) {
 
-            // 1. Read Rhino Encoder (TIM2)
-            // Using int32_t to handle negative values if it wraps
-            int32_t rhino_raw = (int32_t)__HAL_TIM_GET_COUNTER(&htim2);
+                    // 1. Debug: Read the raw timer directly to see if hardware is alive
+                    // We cast to long (int32_t) which printf handles easily with %ld
+                    int32_t raw_timer = (int32_t)__HAL_TIM_GET_COUNTER(&htim8);
 
-            // 2. Calculate Rhino Angle
-            float rhino_angle = (rhino_raw / RHINO_COUNTS_PER_REV) * 360.0f;
+                    // 2. Calculate Angle (Cast to int32_t to fix "ld" print error)
+                    // limiting to 32-bit is fine for display
+                    int32_t total_ticks_32 = (int32_t)rhino_total_ticks;
 
-            // 3. Formatting for Printf
-            int t_int = (int)target_angle;
-            int c_int = (int)current_output_angle;
-            int c_dec = (int)((current_output_angle - c_int) * 100); if(c_dec < 0) c_dec = -c_dec;
+                    // Calculate degrees
+                    float rhino_deg_f = (total_ticks_32 / RHINO_COUNTS_PER_REV) * 360.0f;
+                    int32_t rhino_deg_int = (int32_t)rhino_deg_f;
 
-            int r_int = (int)rhino_angle;
-            int r_dec = (int)((rhino_angle - r_int) * 10); if(r_dec < 0) r_dec = -r_dec;
+                    int32_t nema_ang = (int32_t)current_output_angle;
 
-            printf("Targ:%d | PID_Curr:%d.%02d | Rh_Raw:%ld | Rh_Ang:%d.%d \r\n",
-                   t_int, c_int, c_dec, rhino_raw, r_int, r_dec);
+                    // FIXED PRINTF: Using %ld (Long Int) instead of %lld
+                    printf("NEMA:%ld | RAW_TIM8:%ld | TICKS:%ld | RHINO_ANG:%ld\r\n",
+                           nema_ang, raw_timer, total_ticks_32, rhino_deg_int);
 
-            last_print = HAL_GetTick();
-        }
+                    last_print = HAL_GetTick();
+                }
     }
-    HAL_Delay(10);
+    HAL_Delay(10); // Small delay to prevent CPU hogging
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -374,55 +393,6 @@ static void MX_I2C1_Init(void)
   /* USER CODE BEGIN I2C1_Init 2 */
 
   /* USER CODE END I2C1_Init 2 */
-
-}
-
-/**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM2_Init(void)
-{
-
-  /* USER CODE BEGIN TIM2_Init 0 */
-
-  /* USER CODE END TIM2_Init 0 */
-
-  TIM_Encoder_InitTypeDef sConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM2_Init 1 */
-
-  /* USER CODE END TIM2_Init 1 */
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 0;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 4294967295;
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
-  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 0;
-  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC2Filter = 0;
-  if (HAL_TIM_Encoder_Init(&htim2, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM2_Init 2 */
-
-  /* USER CODE END TIM2_Init 2 */
 
 }
 
@@ -545,6 +515,56 @@ static void MX_TIM4_Init(void)
 }
 
 /**
+  * @brief TIM8 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM8_Init(void)
+{
+
+  /* USER CODE BEGIN TIM8_Init 0 */
+
+  /* USER CODE END TIM8_Init 0 */
+
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM8_Init 1 */
+
+  /* USER CODE END TIM8_Init 1 */
+  htim8.Instance = TIM8;
+  htim8.Init.Prescaler = 0;
+  htim8.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim8.Init.Period = 65535;
+  htim8.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim8.Init.RepetitionCounter = 0;
+  htim8.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 0;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 0;
+  if (HAL_TIM_Encoder_Init(&htim8, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim8, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM8_Init 2 */
+
+  /* USER CODE END TIM8_Init 2 */
+
+}
+
+/**
   * @brief USART3 Initialization Function
   * @param None
   * @retval None
@@ -628,10 +648,10 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(STEP_DIR_GPIO_Port, STEP_DIR_Pin, GPIO_PIN_RESET);
@@ -691,7 +711,7 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
+// No extra code here
 /* USER CODE END 4 */
 
 /**
